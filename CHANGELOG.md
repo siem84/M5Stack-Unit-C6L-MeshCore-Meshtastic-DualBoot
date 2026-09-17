@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 ## v0.3.0-beta
 
@@ -26,6 +26,8 @@ Hardware-tested M5Stack Unit C6L DualBoot release.
 
 ### MeshCore
 
+- based on the previously developed M5Stack Unit C6L MeshCore port by `siem84`
+- original upstream base: MeshCore `dev / ac7d88e`
 - Companion Radio BLE
 - M5Stack Unit C6L OLED support
 - dedicated `mc_spiffs`

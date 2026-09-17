@@ -1,4 +1,4 @@
-﻿[English](README.md) | [Polski](README_PL.md)
+[English](README.md) | [Polski](README_PL.md)
 
 # M5Stack Unit C6L — MeshCore + Meshtastic DualBoot
 
@@ -17,13 +17,20 @@ DualBoot dla **M5Stack Unit C6L**, łączący:
 
 Wersja przetestowana na rzeczywistym urządzeniu M5Stack Unit C6L.
 
-### Użyte wersje bazowe
+### Pochodzenie projektu
 
-| Komponent | Wersja / rewizja |
+| Komponent | Baza |
 |---|---|
-| MeshCore | `dev` / `ac7d88e` |
-| Meshtastic | `2.7.26` / `54e0d8d` |
+| MeshCore dla C6L | wcześniejszy projekt/port MeshCore dla M5Stack Unit C6L autorstwa `siem84` |
+| Pierwotna baza upstream MeshCore | `dev` / `ac7d88e` |
+| Meshtastic | oficjalny `2.7.26` / `54e0d8d` |
 | C6L DualBoot UI | `v0.3.0` |
+
+MeshCore używany w tym projekcie DualBoot **nie jest nowym portem wykonanym bezpośrednio ze standardowego oficjalnego MeshCore**.
+
+Bazą jest wcześniej opracowana i działająca **wersja MeshCore dla M5Stack Unit C6L autorstwa siem84**, która pierwotnie powstała na bazie oficjalnego projektu MeshCore. W obecnym projekcie DualBoot ta wersja C6L została dalej rozwinięta o obsługę DualBoot, menu startowe, Radio Rain, trwały wybór systemu domyślnego oraz poprawki związane z pamięcią.
+
+Publiczny patch MeshCore jest przygotowany względem wskazanej rewizji oficjalnego MeshCore, dzięki czemu z oficjalnej bazy można odtworzyć pełny zestaw zmian C6L + DualBoot.
 
 ## Uruchamianie
 

@@ -1,4 +1,4 @@
-﻿# Licensing and upstream projects
+# Licensing and upstream projects
 
 This project contains modifications associated with two independent upstream open-source projects.
 
@@ -9,6 +9,8 @@ Upstream project:
 https://github.com/meshcore-dev/MeshCore
 
 MeshCore is distributed under the MIT License.
+
+The MeshCore-side work includes the earlier M5Stack Unit C6L port developed by `siem84`, itself derived from MeshCore upstream, together with the later DualBoot modifications.
 
 The MeshCore modification patch remains subject to the applicable upstream copyright and license terms.
 

@@ -1,4 +1,4 @@
-﻿# M5Stack Unit C6L DualBoot v0.3.0-beta
+# M5Stack Unit C6L DualBoot v0.3.0-beta
 
 First public beta release of the M5Stack Unit C6L DualBoot firmware combining:
 
@@ -8,11 +8,27 @@ First public beta release of the M5Stack Unit C6L DualBoot firmware combining:
 - Radio Rain startup animation
 - persistent default-system selection
 
-## Base versions
+## Project lineage and base versions
 
-- MeshCore: dev / ac7d88e
-- Meshtastic: 2.7.26 / 54e0d8d
-- C6L DualBoot UI: v0.3.0
+### MeshCore
+
+The MeshCore component continues the previously developed **M5Stack Unit C6L MeshCore port by siem84**.
+
+That earlier C6L project was originally derived from official MeshCore:
+
+- upstream MeshCore base: `dev / ac7d88e`
+- C6L port/project: `siem84`
+- current project: C6L DualBoot `v0.3.0`
+
+The supplied MeshCore patch is based against the upstream revision and contains the full C6L + DualBoot modification set.
+
+### Meshtastic
+
+- official Meshtastic: `2.7.26 / 54e0d8d`
+
+### DualBoot UI
+
+- C6L DualBoot UI: `v0.3.0`
 
 ## USER button
 

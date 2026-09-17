@@ -1,4 +1,4 @@
-﻿# Technical details
+# Technical details
 
 ## Hardware
 
@@ -48,7 +48,19 @@ Flash end:
 
 ## MeshCore
 
-Reference revision:
+### Lineage
+
+The MeshCore side of this project continues the previously developed **M5Stack Unit C6L MeshCore port by siem84**.
+
+Development lineage:
+
+`official MeshCore dev/ac7d88e`
+→ `siem84 M5Stack Unit C6L MeshCore port`
+→ `current C6L DualBoot version`
+
+The published patch is intentionally based against upstream MeshCore `dev / ac7d88e`, so it contains both the earlier C6L-port changes and the later DualBoot-specific modifications.
+
+Upstream reference revision:
 
 `dev / ac7d88e`
 
