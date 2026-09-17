@@ -1,5 +1,7 @@
 [English](README.md) | [Polski](README_PL.md)
 
+![M5Stack Unit C6L MeshCore + Meshtastic DualBoot](docs/images/UNIT_C6L_Dual_Boot_by_siem84.png)
+
 # M5Stack Unit C6L — MeshCore + Meshtastic DualBoot
 ## About this project
 
