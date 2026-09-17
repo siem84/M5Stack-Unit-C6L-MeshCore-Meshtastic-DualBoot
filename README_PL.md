@@ -1,6 +1,17 @@
 [English](README.md) | [Polski](README_PL.md)
 
 # M5Stack Unit C6L — MeshCore + Meshtastic DualBoot
+## O projekcie
+
+M5Stack Unit C6L to małe urządzenie z radiem LoRa, które może pracować z różnymi systemami mesh. Ten projekt powstał po to, żeby nie trzeba było wybierać tylko jednego z nich. Zamiast za każdym razem wgrywać inne firmware, urządzenie może uruchomić MeshCore albo Meshtastic — wybór odbywa się bezpośrednio z prostego menu na ekranie.
+
+Podstawą projektu była moja wcześniejsza wersja **[MeshCore-M5Stack-Unit-C6L-UI](https://github.com/siem84/MeshCore-M5Stack-Unit-C6L-UI)**, przygotowana specjalnie dla M5Stack Unit C6L i rozwijana na bazie oficjalnego projektu MeshCore. Do niej została dołączona oficjalna wersja Meshtastic oraz mechanizm DualBoot, który pozwala korzystać z obu systemów na jednym urządzeniu.
+
+Najważniejsze założenie było proste: **jedno C6L, dwa systemy i możliwie łatwa obsługa bez ciągłego przeprogramowywania urządzenia.**
+
+Życzę udanej zabawy  
+**siem84 (siemkowsky)**
+
 
 DualBoot dla **M5Stack Unit C6L**, łączący:
 
