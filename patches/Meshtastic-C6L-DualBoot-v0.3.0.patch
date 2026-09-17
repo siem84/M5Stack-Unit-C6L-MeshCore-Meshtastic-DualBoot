@@ -1,0 +1,251 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+index 8b47c102e..0e2d1146e 100644
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -56,7 +56,7 @@
+ #include <utility/bonding.h>
+ #endif
+ 
+-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI
++#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI && !defined(MESHTASTIC_DUALBOOT_C6L)
+ #include <MeshtasticOTA.h>
+ #endif
+ 
+@@ -538,9 +538,11 @@ bool NodeDB::factoryReset(bool eraseBleBonds)
+     saveToDisk();
+     if (eraseBleBonds) {
+         LOG_INFO("Erase BLE bonds");
+-#ifdef ARCH_ESP32
++#if defined(ARCH_ESP32) && !defined(MESHTASTIC_DUALBOOT_C6L)
+         // This will erase what's in NVS including ssl keys, persistent variables and ble pairing
+         nvs_flash_erase();
++#elif defined(ARCH_ESP32)
++    LOG_WARN("BLE bond erase requested, but global NVS erase is disabled in C6L dualboot");
+ #endif
+ #ifdef ARCH_NRF52
+         LOG_INFO("Clear bluetooth bonds!");
+@@ -785,7 +787,7 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
+ #ifdef COMPASS_ORIENTATION
+     config.display.compass_orientation = COMPASS_ORIENTATION;
+ #endif
+-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI
++#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI && !defined(MESHTASTIC_DUALBOOT_C6L)
+     if (MeshtasticOTA::isUpdated()) {
+         MeshtasticOTA::recoverConfig(&config.network);
+     }
+diff --git a/src/modules/AdminModule.cpp b/src/modules/AdminModule.cpp
+index 6c8438bbb..0eda493e5 100644
+--- a/src/modules/AdminModule.cpp
++++ b/src/modules/AdminModule.cpp
+@@ -9,7 +9,7 @@
+ #include "meshUtils.h"
+ #include <FSCommon.h>
+ #include <ctype.h> // for better whitespace handling
+-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI
++#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI && !defined(MESHTASTIC_DUALBOOT_C6L)
+ #include "MeshtasticOTA.h"
+ #endif
+ #include "Router.h"
+@@ -235,6 +235,11 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
+         break;
+     }
+     case meshtastic_AdminMessage_ota_request_tag: {
++#if defined(MESHTASTIC_DUALBOOT_C6L)
++        suppressRebootBanner = true;
++        sendWarningAndLog("OTA is disabled in the C6L dualboot build.");
++        break;
++#else
+ #if defined(ARCH_ESP32)
+         LOG_INFO("OTA Requested");
+ 
+@@ -282,6 +287,7 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
+         LOG_INFO("Reboot in %d seconds", s);
+         rebootAtMsec = (s < 0) ? 0 : (millis() + s * 1000);
+         break;
++#endif
+     }
+     case meshtastic_AdminMessage_shutdown_seconds_tag: {
+         int32_t s = r->shutdown_seconds;
+diff --git a/src/platform/esp32/DualBootC6L.cpp b/src/platform/esp32/DualBootC6L.cpp
+new file mode 100644
+index 000000000..8529775c7
+--- /dev/null
++++ b/src/platform/esp32/DualBootC6L.cpp
+@@ -0,0 +1,47 @@
++#include "DualBootC6L.h"
++
++#if defined(MESHTASTIC_DUALBOOT_C6L)
++
++#include "configuration.h"
++#include "main.h"
++#include <esp_err.h>
++#include <esp_ota_ops.h>
++#include <esp_partition.h>
++
++void configureDualBootC6LNextPartition()
++{
++    const esp_partition_t *running = esp_ota_get_running_partition();
++    if (running == nullptr) {
++        LOG_WARN("DUALBOOT: running partition unavailable; keeping current system");
++        return;
++    }
++
++    esp_partition_subtype_t target_subtype;
++    if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) {
++        target_subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0;
++    } else if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) {
++        target_subtype = ESP_PARTITION_SUBTYPE_APP_OTA_1;
++    } else {
++        LOG_WARN("DUALBOOT: unsupported running subtype 0x%02x; keeping current system", running->subtype);
++        return;
++    }
++
++    const esp_partition_t *target =
++        esp_partition_find_first(ESP_PARTITION_TYPE_APP, target_subtype, nullptr);
++    if (target == nullptr) {
++        LOG_WARN("DUALBOOT: target partition missing; keeping current system");
++        return;
++    }
++
++    LOG_INFO("DUALBOOT: running=%s target=%s", running->label, target->label);
++    const esp_err_t result = esp_ota_set_boot_partition(target);
++    if (result != ESP_OK) {
++        LOG_WARN("DUALBOOT: cannot set %s as next boot: %s (0x%x); continuing", target->label,
++                 esp_err_to_name(result), result);
++        return;
++    }
++
++    LOG_INFO("DUALBOOT: next boot set to %s; no restart requested", target->label);
++}
++
++#endif
+diff --git a/src/platform/esp32/DualBootC6L.h b/src/platform/esp32/DualBootC6L.h
+new file mode 100644
+index 000000000..adf6d1e50
+--- /dev/null
++++ b/src/platform/esp32/DualBootC6L.h
+@@ -0,0 +1,5 @@
++#pragma once
++
++#if defined(MESHTASTIC_DUALBOOT_C6L)
++void configureDualBootC6LNextPartition();
++#endif
+diff --git a/src/platform/esp32/main-esp32.cpp b/src/platform/esp32/main-esp32.cpp
+index d27960cc9..c0049144c 100644
+--- a/src/platform/esp32/main-esp32.cpp
++++ b/src/platform/esp32/main-esp32.cpp
+@@ -8,7 +8,10 @@
+ #include "nimble/NimbleBluetooth.h"
+ #endif
+ 
++#if !defined(MESHTASTIC_DUALBOOT_C6L)
+ #include <MeshtasticOTA.h>
++#endif
++#include "DualBootC6L.h"
+ 
+ #if HAS_WIFI
+ #include "mesh/wifi/WiFiAPClient.h"
+@@ -149,7 +152,7 @@ void esp32Setup()
+         preferences.putUInt("hwVendor", HW_VENDOR);
+     preferences.end();
+     LOG_DEBUG("Number of Device Reboots: %d", rebootCounter);
+-#if !MESHTASTIC_EXCLUDE_WIFI
++#if !MESHTASTIC_EXCLUDE_WIFI && !defined(MESHTASTIC_DUALBOOT_C6L)
+     String version = MeshtasticOTA::getVersion();
+     if (version.isEmpty()) {
+         LOG_INFO("MeshtasticOTA firmware not available");
+@@ -159,6 +162,10 @@ void esp32Setup()
+     MeshtasticOTA::initialize();
+ #endif
+ 
++#if defined(MESHTASTIC_DUALBOOT_C6L)
++    configureDualBootC6LNextPartition();
++#endif
++
+     // enableModemSleep();
+ 
+ // Since we are turning on watchdogs rather late in the release schedule, we really don't want to catch any
+diff --git a/variants/esp32c6/m5stack_unitc6l/boards/esp32-c6-devkitc-1-16mb-dio.json b/variants/esp32c6/m5stack_unitc6l/boards/esp32-c6-devkitc-1-16mb-dio.json
+new file mode 100644
+index 000000000..c1c0c9f12
+--- /dev/null
++++ b/variants/esp32c6/m5stack_unitc6l/boards/esp32-c6-devkitc-1-16mb-dio.json
+@@ -0,0 +1,41 @@
++{
++  "build": {
++    "arduino": {
++      "ldscript": "esp32c6.rom.ld"
++    },
++    "core": "esp32",
++    "extra_flags": [
++      "-DARDUINO_ESP32C6_DEV"
++    ],
++    "f_cpu": "160000000L",
++    "f_flash": "80000000L",
++    "flash_mode": "dio",
++    "mcu": "esp32c6",
++    "variant": "esp32c6"
++  },
++  "connectivity": [
++    "bluetooth",
++    "wifi"
++  ],
++  "debug": {
++    "openocd_target": "esp32c6.cfg",
++    "default_tool": "esp-builtin",
++    "onboard_tools": [
++      "esp-builtin"
++    ],
++    "svd_path": "esp32c6.svd"
++  },
++  "frameworks": [
++    "arduino",
++    "espidf"
++  ],
++  "name": "ESP32-C6-DevKitC-1 16MB DIO",
++  "upload": {
++    "flash_size": "16MB",
++    "maximum_ram_size": 327680,
++    "maximum_size": 16777216,
++    "require_upload_port": true,
++    "speed": 460800
++  },
++  "vendor": "Espressif"
++}
+diff --git a/variants/esp32c6/m5stack_unitc6l/dualboot_c6l_16MB.csv b/variants/esp32c6/m5stack_unitc6l/dualboot_c6l_16MB.csv
+new file mode 100644
+index 000000000..4943c5fba
+--- /dev/null
++++ b/variants/esp32c6/m5stack_unitc6l/dualboot_c6l_16MB.csv
+@@ -0,0 +1,8 @@
++# Name,     Type, SubType, Offset,   Size,     Flags
++nvs,        data, nvs,     0x009000, 0x005000,
++otadata,    data, ota,     0x00E000, 0x002000,
++app0,       app,  ota_0,   0x010000, 0x640000,
++app1,       app,  ota_1,   0x650000, 0x640000,
++spiffs,     data, spiffs,  0xC90000, 0x300000,
++mc_spiffs,  data, spiffs,  0xF90000, 0x060000,
++coredump,   data, coredump,0xFF0000, 0x010000,
+\ No newline at end of file
+diff --git a/variants/esp32c6/m5stack_unitc6l/platformio.ini b/variants/esp32c6/m5stack_unitc6l/platformio.ini
+index bf605ca61..80ec53682 100644
+--- a/variants/esp32c6/m5stack_unitc6l/platformio.ini
++++ b/variants/esp32c6/m5stack_unitc6l/platformio.ini
+@@ -42,3 +42,17 @@ lib_ignore =
+   libpax
+ build_src_filter = 
+  ${esp32c6_base.build_src_filter} +<../variants/esp32c6/m5stack_unitc6l>
++
++[env:m5stack-unitc6l-dualboot]
++extends = env:m5stack-unitc6l
++board_dir = variants/esp32c6/m5stack_unitc6l/boards
++board = esp32-c6-devkitc-1-16mb-dio
++board_build.flash_mode = dio
++board_build.partitions = variants/esp32c6/m5stack_unitc6l/dualboot_c6l_16MB.csv
++build_flags =
++  ${env:m5stack-unitc6l.build_flags}
++  -D MESHTASTIC_DUALBOOT_C6L=1
++build_src_filter =
++  ${env:m5stack-unitc6l.build_src_filter}
++  +<platform/esp32/DualBootC6L.cpp>
++  -<platform/esp32/MeshtasticOTA.cpp>

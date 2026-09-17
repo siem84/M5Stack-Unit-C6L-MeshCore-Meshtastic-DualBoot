@@ -1,0 +1,17 @@
+﻿# Generated / local files
+*.log
+*.bak
+*.tmp
+*.zip
+
+# Firmware binaries are distributed through Releases
+*.bin
+
+# PlatformIO
+.pio/
+build/
+
+# Editors / operating system
+.vscode/
+.DS_Store
+Thumbs.db

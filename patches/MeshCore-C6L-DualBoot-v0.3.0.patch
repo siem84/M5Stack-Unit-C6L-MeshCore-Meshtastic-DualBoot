@@ -1,0 +1,1986 @@
+diff --git a/examples/companion_radio/DataStore.cpp b/examples/companion_radio/DataStore.cpp
+index 06c56a7a..f8c90114 100644
+--- a/examples/companion_radio/DataStore.cpp
++++ b/examples/companion_radio/DataStore.cpp
+@@ -1,5 +1,11 @@
+ #include <Arduino.h>
++#include <errno.h>
+ #include "DataStore.h"
++#if defined(ESP32) && defined(MESHCORE_M5STACK_UNIT_C6L)
++#include <SPIFFS.h>
++#include <esp_spiffs.h>
++#include <StreamString.h>
++#endif
+ 
+ #if defined(EXTRAFS) || defined(QSPIFLASH)
+   #define MAX_BLOBRECS 100
+@@ -174,8 +180,12 @@ bool DataStore::formatFileSystem() {
+   return LittleFS.format();
+ #elif defined(ESP32)
+   bool fs_success = ((fs::SPIFFSFS *)_fs)->format();
++#if defined(MESHCORE_DUALBOOT)
++  return fs_success;
++#else
+   esp_err_t nvs_err = nvs_flash_erase(); // no need to reinit, will be done by reboot
+   return fs_success && (nvs_err == ESP_OK);
++#endif
+ #else
+   #error "need to implement format()"
+ #endif
+@@ -246,11 +256,100 @@ void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs) {
+   }
+ }
+ 
++#if defined(ESP32) && defined(MESHCORE_M5STACK_UNIT_C6L)
++static constexpr size_t C6L_PREFS_RESERVE = 16 * 1024;
++
++#if defined(MESHCORE_DUALBOOT)
++static constexpr const char* C6L_SPIFFS_PARTITION_LABEL = "mc_spiffs";
++#else
++static constexpr const char* C6L_SPIFFS_PARTITION_LABEL = nullptr;
++#endif
++class C6LPrefsBuffer : public StreamString {
++public:
++  size_t write(const uint8_t* data, size_t size) override {
++    const size_t n = StreamString::write(data, size);
++    if (n != size) setWriteError();
++    return n;
++  }
++  size_t write(uint8_t value) override { return write(&value, 1); }
++};
++
++// Only raw advert cache entries are disposable, never contact records or prefs.
++static bool c6lMakePrefsRoom(size_t required) {
++  for (;;) {
++    const esp_err_t gc = esp_spiffs_gc(C6L_SPIFFS_PARTITION_LABEL, required);
++    if (gc == ESP_OK) return true;
++    if (gc != ESP_ERR_NOT_FINISHED) return false;
++    String victim;
++    time_t oldest = 0;
++    File root = SPIFFS.open("/", "r");
++    if (!root || !root.isDirectory()) { root.close(); return false; }
++    for (File f = root.openNextFile("r"); f; f = root.openNextFile("r")) {
++      const String path = f.path();
++      const time_t modified = f.getLastWrite();
++      bool cache = !f.isDirectory() && path.startsWith("/bl/") &&
++                   path.length() >= 6 && path.length() <= 20 && path.length() % 2 == 0;
++      for (size_t i = 4; cache && i < path.length(); ++i) {
++        const char c = path[i];
++        cache = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
++      }
++      f.close();
++      if (cache && (!victim.length() || modified < oldest ||
++                    (modified == oldest && path.compareTo(victim) < 0))) {
++        victim = path;
++        oldest = modified;
++      }
++    }
++    root.close();
++    if (!victim.length() || !SPIFFS.remove(victim)) return false;
++    // Each iteration removes one existing cache entry, so the loop is bounded.
++  }
++}
++#endif
++
+ bool DataStore::savePrefs(NodePrefs& _prefs) {
++#if defined(ESP32) && defined(MESHCORE_M5STACK_UNIT_C6L)
++  C6LPrefsBuffer encoded;
++  if (_fs == &SPIFFS) {
++    const bool serialized = _prefs.saveSerial(encoded);
++    if (!serialized || encoded.getWriteError() ||
++        !c6lMakePrefsRoom(C6L_PREFS_RESERVE + encoded.length())) {
++      return false;  // Existing prefs have not been opened/truncated.
++    }
++  }
++#endif
+   File file = openWrite(_fs, "/prefs.json");
++#if defined(ESP32) && defined(MESHCORE_M5STACK_UNIT_C6L)
++  const int open_error = errno;
++  if (!file && open_error == ENOSPC && _fs == &SPIFFS) {
++    file.close();
++    if (esp_spiffs_gc(C6L_SPIFFS_PARTITION_LABEL, 4096) == ESP_OK) {
++      errno = 0;
++      file = openWrite(_fs, "/prefs.json");  // One retry only.
++    } else {
++      errno = open_error;
++    }
++  }
++#endif
+   if (file) {
+-    bool success = _prefs.saveSerial(file);
++    bool success;
++#if defined(ESP32) && defined(MESHCORE_M5STACK_UNIT_C6L)
++    if (_fs == &SPIFFS) {
++      success = file.write(reinterpret_cast<const uint8_t*>(encoded.c_str()), encoded.length()) == encoded.length();
++    } else
++#endif
++    success = _prefs.saveSerial(file);
+     file.close();
++#if defined(ESP32) && defined(MESHCORE_M5STACK_UNIT_C6L)
++    if (success && _fs == &SPIFFS) {
++      File verify = openRead(_fs, "/prefs.json");
++      success = verify && verify.size() == encoded.length();
++      for (size_t i = 0; success && i < encoded.length(); ++i) {
++        success = verify.read() == static_cast<uint8_t>(encoded[i]);
++      }
++      verify.close();
++    }
++#endif
+     return success;
+   }
+   return false;
+@@ -567,6 +666,11 @@ uint8_t DataStore::getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_b
+   char path[64];
+   makeBlobPath(key, key_len, path, sizeof(path));
+ 
++#if defined(ESP32) && defined(MESHCORE_M5STACK_UNIT_C6L)
++  // Do not refill the prefs reserve with optional raw adverts.
++  if (_fs == &SPIFFS && esp_spiffs_gc(nullptr, C6L_PREFS_RESERVE + 4096) != ESP_OK) return false;
++#endif
++
+   if (_fs->exists(path)) {
+     File f = openRead(_fs, path);
+     if (f) {
+diff --git a/examples/companion_radio/MyMesh.cpp b/examples/companion_radio/MyMesh.cpp
+index 46c8e2f6..4c63e10e 100644
+--- a/examples/companion_radio/MyMesh.cpp
++++ b/examples/companion_radio/MyMesh.cpp
+@@ -3,6 +3,7 @@
+ #include <Arduino.h> // needed for PlatformIO
+ #include <Mesh.h>
+ 
++
+ #define CMD_APP_START                 1
+ #define CMD_SEND_TXT_MSG              2
+ #define CMD_SEND_CHANNEL_TXT_MSG      3
+@@ -606,7 +607,7 @@ void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uin
+   queueMessage(from, TXT_TYPE_SIGNED_PLAIN, pkt, sender_timestamp, sender_prefix, 4, text);
+ }
+ 
+-void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
++void MyMesh::onChannelMessageRecv(const mesh::GroupChannel& channel, mesh::Packet *pkt, uint32_t timestamp,
+                                   const char *text) {
+   int i = 0;
+   if (app_target_ver >= 3) {
+@@ -1300,7 +1301,7 @@ void MyMesh::handleCmdFrame(size_t len) {
+     if (nlen > sizeof(_prefs.node_name) - 1) nlen = sizeof(_prefs.node_name) - 1; // max len
+     memcpy(_prefs.node_name, &cmd_frame[1], nlen);
+     _prefs.node_name[nlen] = 0; // null terminator
+-    savePrefs();
++    if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+     writeOKFrame();
+   } else if (cmd_frame[0] == CMD_SET_ADVERT_LATLON && len >= 9) {
+     int32_t lat, lon, alt = 0;
+@@ -1312,7 +1313,7 @@ void MyMesh::handleCmdFrame(size_t len) {
+     if (lat <= 90 * 1E6 && lat >= -90 * 1E6 && lon <= 180 * 1E6 && lon >= -180 * 1E6) {
+       sensors.node_lat = ((double)lat) / 1000000.0;
+       sensors.node_lon = ((double)lon) / 1000000.0;
+-      savePrefs();
++      if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+       writeOKFrame();
+     } else {
+       writeErrFrame(ERR_CODE_ILLEGAL_ARG); // invalid geo coordinate
+@@ -1486,7 +1487,7 @@ void MyMesh::handleCmdFrame(size_t len) {
+       _prefs.freq = (float)freq / 1000.0;
+       _prefs.bw = (float)bw / 1000.0;
+       _prefs.setRepeatEn(repeat != 0);
+-      savePrefs();
++      if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+ 
+       radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
+@@ -1504,7 +1505,7 @@ void MyMesh::handleCmdFrame(size_t len) {
+       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+     } else {
+       _prefs.tx_power_dbm = power;
+-      savePrefs();
++      if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+       radio_driver.setTxPower(_prefs.tx_power_dbm);
+       writeOKFrame();
+     }
+@@ -1517,7 +1518,7 @@ void MyMesh::handleCmdFrame(size_t len) {
+     i += 4;
+     _prefs.rx_delay_base = ((float)rx) / 1000.0f;
+     _prefs.airtime_factor = ((float)af) / 1000.0f;
+-    savePrefs();
++    if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+     writeOKFrame();
+   } else if (cmd_frame[0] == CMD_GET_TUNING_PARAMS) {
+     uint32_t rx = _prefs.rx_delay_base * 1000, af = _prefs.airtime_factor * 1000;
+@@ -1540,14 +1541,14 @@ void MyMesh::handleCmdFrame(size_t len) {
+         }
+       }
+     }
+-    savePrefs();
++    if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+     writeOKFrame();
+   } else if (cmd_frame[0] == CMD_SET_PATH_HASH_MODE && cmd_frame[1] == 0 && len >= 3) {
+     if (cmd_frame[2] >= 3) {
+       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+     } else {
+       _prefs.path_hash_mode = cmd_frame[2];
+-      savePrefs();
++      if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+       writeOKFrame();
+     }
+   } else if (cmd_frame[0] == CMD_REBOOT && memcmp(&cmd_frame[1], "reboot", 6) == 0) {
+@@ -1886,7 +1887,7 @@ void MyMesh::handleCmdFrame(size_t len) {
+     // ensure pin is zero, or a valid 6 digit pin
+     if (pin == 0 || (pin >= 100000 && pin <= 999999)) {
+       _prefs.ble_pin = pin;
+-      savePrefs();
++      if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+       writeOKFrame();
+     } else {
+       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+@@ -1917,11 +1918,11 @@ void MyMesh::handleCmdFrame(size_t len) {
+         // Update node preferences for GPS settings
+         if (strcmp(sp, "gps") == 0) {
+           _prefs.gps_enabled = (np[0] == '1') ? 1 : 0;
+-          savePrefs();
++          if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+         } else if (strcmp(sp, "gps_interval") == 0) {
+           uint32_t interval_seconds = atoi(np);
+           _prefs.gps_interval = constrain(interval_seconds, 0, 86400);
+-          savePrefs();
++          if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+         }
+         #endif
+         writeOKFrame();
+@@ -2033,7 +2034,7 @@ void MyMesh::handleCmdFrame(size_t len) {
+       if (n > 0 && n < 31) {
+         strcpy(_prefs.default_scope_name, (char *) &cmd_frame[1]);
+         memcpy(_prefs.default_scope_key, &cmd_frame[1+31], 16);
+-        savePrefs();
++        if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+         writeOKFrame();
+       } else {
+         writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+@@ -2041,7 +2042,7 @@ void MyMesh::handleCmdFrame(size_t len) {
+     } else {
+       memset(_prefs.default_scope_name, 0, sizeof(_prefs.default_scope_name));  // set default scope to null
+       memset(_prefs.default_scope_key, 0, sizeof(_prefs.default_scope_key));
+-      savePrefs();
++      if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+       writeOKFrame();
+     }
+   } else if (cmd_frame[0] == CMD_GET_DEFAULT_FLOOD_SCOPE) {
+@@ -2066,7 +2067,7 @@ void MyMesh::handleCmdFrame(size_t len) {
+     if (len >= 3) {
+       _prefs.autoadd_max_hops = min(cmd_frame[2], (uint8_t)64);
+     }
+-    savePrefs();
++    if (!savePrefs()) { writeErrFrame(ERR_CODE_FILE_IO_ERROR); return; }
+     writeOKFrame();
+   } else if (cmd_frame[0] == CMD_GET_AUTOADD_CONFIG) {
+     int i = 0;
+@@ -2128,20 +2129,20 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
+   }
+ 
+   if (_prefs.getRadioPrefs()->handleCommand(command, sender_timestamp, reply)) {  // is radio CLI command?
+-    if (_prefs.getRadioPrefs()->isDirty()) { savePrefs(); }
++    if (_prefs.getRadioPrefs()->isDirty()) { if (!savePrefs()) { strcpy(reply, "Error, prefs write failed"); return true; } }
+     return true;
+   }
+ 
+   // hook for variant-specific CLI processing
+   if (board.handleCommand(command, sender_timestamp, reply)) {
+-    if (_prefs.isDirty()) { savePrefs(); }
++    if (_prefs.isDirty()) { if (!savePrefs()) { strcpy(reply, "Error, prefs write failed"); return true; } }
+     return true;
+   }
+ 
+   if (memcmp(command, "set name ", 9) == 0) {
+     if (AdvertDataParser::isValidName(&command[9])) {
+       StrHelper::strncpy(_prefs.node_name, &command[9], sizeof(_prefs.node_name));
+-      savePrefs();
++      if (!savePrefs()) { strcpy(reply, "Error, prefs write failed"); return true; }
+       strcpy(reply, "OK");
+     } else {
+       strcpy(reply, "Error, bad chars");
+@@ -2155,7 +2156,7 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
+ 
+   if (memcmp(command, "set pin ", 8) == 0) {
+     _prefs.ble_pin = atoi(&command[8]);
+-    savePrefs();
++    if (!savePrefs()) { strcpy(reply, "Error, prefs write failed"); return true; }
+     sprintf(reply, "> pin is now %06d", _prefs.ble_pin);
+     return true;
+   }
+@@ -2180,7 +2181,7 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
+       strcpy(reply, "Error, must be from -12 to +14");
+     } else {
+       _prefs.tz_offset = tz;
+-      savePrefs();
++      if (!savePrefs()) { strcpy(reply, "Error, prefs write failed"); return true; }
+       strcpy(reply, "OK");
+     }
+     return true;
+@@ -2214,10 +2215,10 @@ void MyMesh::checkCLIRescueCmd() {
+       bool success = _store->formatFileSystem();
+       if (success) {
+         _store->saveMainIdentity(self_id);
+-        savePrefs();
++        const bool prefs_saved = savePrefs();
+         saveContacts();
+         saveChannels();
+-        Serial.println("  > erase and rebuild done");
++        Serial.println(prefs_saved ? "  > erase and rebuild done" : "  Error: prefs write failed");
+       } else {
+         Serial.println("  Error: erase failed");
+       }
+diff --git a/examples/companion_radio/MyMesh.h b/examples/companion_radio/MyMesh.h
+index 3b98a4f6..c5ec969f 100644
+--- a/examples/companion_radio/MyMesh.h
++++ b/examples/companion_radio/MyMesh.h
+@@ -185,11 +185,12 @@ protected:
+   }
+ 
+ public:
+-  void savePrefs() {
++  bool savePrefs() {
+     _prefs.node_lat = sensors.node_lat;
+     _prefs.node_lon = sensors.node_lon;
+-    _store->savePrefs(_prefs);
++    if (!_store->savePrefs(_prefs)) return false;
+     _prefs.clearDirty();
++    return true;
+   }
+ 
+ #if ENV_INCLUDE_GPS == 1
+diff --git a/examples/companion_radio/NodePrefs.h b/examples/companion_radio/NodePrefs.h
+index 846ff169..21778beb 100644
+--- a/examples/companion_radio/NodePrefs.h
++++ b/examples/companion_radio/NodePrefs.h
+@@ -11,6 +11,7 @@
+ #define ADVERT_LOC_NONE       0
+ #define ADVERT_LOC_SHARE      1
+ 
++
+ class NodePrefs : public ConfigSerializer {  // persisted to file
+ public:
+   float airtime_factor = 0;
+@@ -48,6 +49,7 @@ public:
+   char default_scope_name[31];
+   uint8_t default_scope_key[16];
+   int8_t tz_offset = 0;
++  uint8_t c6l_timezone = 0;
+ 
+ private:
+   class RadioPrefs : public CommonRadioPrefs {
+@@ -156,6 +158,7 @@ private:
+       def("tel_loc", _parent->telemetry_mode_loc);
+       def("tel_env", _parent->telemetry_mode_env);
+       def("tz_offset", _parent->tz_offset);
++      def("c_timezone", _parent->c6l_timezone);
+     }
+   public:
+     CompanionPrefs(NodePrefs* parent) : _parent(parent) { }
+diff --git a/examples/companion_radio/main.cpp b/examples/companion_radio/main.cpp
+index 89f0e6cb..8841f788 100644
+--- a/examples/companion_radio/main.cpp
++++ b/examples/companion_radio/main.cpp
+@@ -1,6 +1,12 @@
+-#include <Arduino.h>   // needed for PlatformIO
++#include <Arduino.h>   // needed for PlatformIO
+ #include <Mesh.h>
+ #include "MyMesh.h"
++#ifdef C6L_OLED_TEST
++  #include <time.h>
++  #include <stdlib.h>
++  #include <helpers/ui/buzzer.h>
++  genericBuzzer c6l_buzzer;
++#endif
+ 
+ // Believe it or not, this std C function is busted on some platforms!
+ static uint32_t _atoi(const char* sp) {
+@@ -85,6 +91,10 @@ MultiSerialInterface interface_manager;
+ #elif defined(ESP32)
+   #include <SPIFFS.h>
+   DataStore store(SPIFFS, rtc_clock);
++  #if defined(MESHCORE_DUALBOOT)
++    #include <helpers/esp32/DualBoot.h>
++    #include <Preferences.h>
++  #endif
+ #endif
+ 
+ /* GLOBAL OBJECTS */
+@@ -101,6 +111,381 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
+    #endif
+ );
+ 
++#ifdef C6L_OLED_TEST
++static unsigned long c6l_oled_last_update = 0;
++static uint8_t c6l_oled_page = 0;
++static bool c6l_button_was_pressed = false;
++static uint32_t c6l_oled_last_activity_ms = 0;
++static bool c6l_oled_sleeping = false;
++static uint32_t c6l_logo_started_ms = 0;
++static bool c6l_boot_logo_done = false;
++static constexpr uint32_t C6L_BOOT_LOGO_MS = 3000;
++static constexpr uint32_t C6L_PAIRING_TIMEOUT_MS = 30000;
++static SerialBLEInterface::PairingDisplayEvent c6l_pairing = {};
++static bool c6l_pairing_visible = false;
++static bool c6l_pairing_was_sleeping = false;
++static uint32_t c6l_pairing_shown_ms = 0;
++static uint32_t c6l_rx_baseline = 0;
++static uint32_t c6l_tx_baseline = 0;
++static bool c6l_led_event_active = false;
++static bool c6l_pending_rx = false;
++static bool c6l_pending_tx = false;
++static bool c6l_led_event_is_rx = false;
++static uint32_t c6l_led_event_until = 0;
++static constexpr uint32_t C6L_OLED_TIMEOUT_MS = 60000;
++static constexpr uint8_t C6L_CLOCK_PAGE = 6;
++static constexpr uint8_t C6L_PAGE_COUNT = 7;
++static constexpr uint32_t C6L_MIN_VALID_TIMESTAMP = 1735689600;  // 1 Jan 2025 UTC
++
++// Persisted IDs: never reorder these profiles.
++static const struct { const char* name; const char* info; const char* tz; } c6l_timezones[] = {
++  {"UTC", "UTC+00:00", "UTC0"},
++  {"EUROPE", "AUTO DST", "CET-1CEST,M3.5.0/2,M10.5.0/3"},
++  {"US EAST", "AUTO DST", "EST5EDT,M3.2.0/2,M11.1.0/2"},
++  {"US WEST", "AUTO DST", "PST8PDT,M3.2.0/2,M11.1.0/2"},
++  {"INDIA", "UTC+05:30", "IST-5:30"}
++};
++static constexpr uint8_t C6L_TZ_COUNT = sizeof(c6l_timezones) / sizeof(c6l_timezones[0]);
++static bool c6l_timezone_mode = false;
++static bool c6l_timezone_error = false;
++static uint8_t c6l_timezone_choice = 0;
++static uint32_t c6l_timezone_activity = 0;
++static bool c6l_button_consumed = false;
++static bool c6l_clock_press = false;
++static uint32_t c6l_clock_pressed_ms = 0;
++
++static uint8_t c6l_validTimezone(uint8_t id) {
++  return id < C6L_TZ_COUNT ? id : 0;
++}
++
++static bool c6l_applyTimezone(uint8_t id) {
++  if (setenv("TZ", c6l_timezones[c6l_validTimezone(id)].tz, 1) != 0) {
++    Serial.println("ERROR: C6L timezone setup failed");
++    return false;
++  }
++  tzset();
++  return true;
++}
++
++static void c6l_setBleLed() {
++  if (bluetooth_interface.isConnected()) {
++    neopixelWrite(P_LORA_TX_NEOPIXEL_LED, 0, 0, 12);
++  } else {
++    neopixelWrite(P_LORA_TX_NEOPIXEL_LED, 10, 10, 10);
++  }
++}
++
++static void c6l_updateLed() {
++  const uint32_t now = millis();
++  const uint32_t packets_recv = radio_driver.getPacketsRecv();
++  const uint32_t packets_sent = radio_driver.getPacketsSent();
++
++  if (packets_recv != c6l_rx_baseline) {
++    c6l_rx_baseline = packets_recv;
++    c6l_pending_rx = true;
++  }
++  if (packets_sent != c6l_tx_baseline) {
++    c6l_tx_baseline = packets_sent;
++    c6l_pending_tx = true;
++  }
++
++  if (c6l_led_event_active && static_cast<int32_t>(now - c6l_led_event_until) >= 0) {
++    c6l_led_event_active = false;
++  }
++
++  if (!c6l_led_event_active) {
++    if (c6l_pending_rx) {
++      c6l_pending_rx = false;
++      c6l_led_event_is_rx = true;
++      c6l_led_event_active = true;
++      c6l_led_event_until = now + 150;
++    } else if (c6l_pending_tx) {
++      c6l_pending_tx = false;
++      c6l_led_event_is_rx = false;
++      c6l_led_event_active = true;
++      c6l_led_event_until = now + 150;
++    }
++  }
++
++  if (c6l_led_event_active) {
++    if (c6l_led_event_is_rx) {
++      neopixelWrite(P_LORA_TX_NEOPIXEL_LED, 32, 0, 0);
++    } else {
++      neopixelWrite(P_LORA_TX_NEOPIXEL_LED, 32, 24, 0);
++    }
++  } else {
++    c6l_setBleLed();
++  }
++}
++
++static void updateC6LOledStatus() {
++  char line[24];
++  const NodePrefs* prefs = the_mesh.getNodePrefs();
++  const char* ble_status = !bluetooth_interface.isEnabled() ? "OFF" :
++                           bluetooth_interface.isConnected() ? "CON" : "ON";
++
++  display.startFrame();
++  display.setTextSize(1);
++  display.setColor(SSD1306_WHITE);
++  if (c6l_pairing_visible) {
++    display.setCursor((64 - display.getTextWidth("PAIRING")) / 2, 0);
++    display.print("PAIRING");
++    if (c6l_pairing.pass_key <= 999999) {
++      snprintf(line, sizeof(line), "%06lu",
++               static_cast<unsigned long>(c6l_pairing.pass_key));
++      // Six 9x18 seven-segment digits, spaced by 2 pixels: 64 pixels total.
++      // Segment order: top, upper right, lower right, bottom, lower left,
++      // upper left, middle. Draw through the existing OLED driver.
++      static constexpr uint8_t segments[10] = {
++        0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
++      };
++      for (uint8_t i = 0; i < 6; ++i) {
++        const int x = i * 11;
++        const int y = 22;
++        const uint8_t mask = segments[line[i] - '0'];
++        if (mask & 0x01) display.fillRect(x + 2, y, 5, 2);
++        if (mask & 0x02) display.fillRect(x + 7, y + 2, 2, 6);
++        if (mask & 0x04) display.fillRect(x + 7, y + 10, 2, 6);
++        if (mask & 0x08) display.fillRect(x + 2, y + 16, 5, 2);
++        if (mask & 0x10) display.fillRect(x, y + 10, 2, 6);
++        if (mask & 0x20) display.fillRect(x, y + 2, 2, 6);
++        if (mask & 0x40) display.fillRect(x + 2, y + 8, 5, 2);
++      }
++    } else {
++      display.setCursor((64 - display.getTextWidth("PIN ERROR")) / 2, 24);
++      display.print("PIN ERROR");
++    }
++  } else if (c6l_timezone_mode) {
++    const char* rows[] = {"TIMEZONE", c6l_timezones[c6l_timezone_choice].name,
++                         c6l_timezone_error ? "TZ ERROR" : c6l_timezones[c6l_timezone_choice].info};
++    for (uint8_t i = 0; i < 3; ++i) {
++      display.setCursor((64 - display.getTextWidth(rows[i])) / 2, i * 16);
++      display.print(rows[i]);
++    }
++  } else if (c6l_oled_page == 0) {
++    const char* mesh_text = "MESH";
++    const char* core_text = "CORE";
++    const char* poland_text = "C6L UI";
++    const int mesh_x = (64 - display.getTextWidth(mesh_text)) / 2;
++    const int core_x = (64 - display.getTextWidth(core_text)) / 2;
++    const int poland_x = (64 - display.getTextWidth(poland_text)) / 2;
++    display.setCursor(mesh_x, 0);
++    display.print(mesh_text);
++    display.setCursor(mesh_x + 1, 0);
++    display.print(mesh_text);
++    display.setCursor(core_x, 14);
++    display.print(core_text);
++    display.setCursor(core_x + 1, 14);
++    display.print(core_text);
++    display.setCursor(poland_x, 34);
++    display.print(poland_text);
++  } else if (c6l_oled_page == 1) {
++    display.setCursor(0, 0);
++    display.print("MeshCore");
++    display.setCursor(0, 12);
++    snprintf(line, sizeof(line), "B:%s", ble_status);
++    display.print(line);
++    display.setCursor(0, 24);
++    if (prefs != NULL && prefs->freq > 0) {
++      snprintf(line, sizeof(line), "L:%.1f", prefs->freq);
++    } else {
++      snprintf(line, sizeof(line), "L:---");
++    }
++    display.print(line);
++    display.setCursor(0, 36);
++    snprintf(line, sizeof(line), "R:%lu T:%lu",
++             static_cast<unsigned long>(radio_driver.getPacketsRecv()),
++             static_cast<unsigned long>(radio_driver.getPacketsSent()));
++    display.print(line);
++  } else if (c6l_oled_page == 2) {
++    display.setCursor(0, 0);
++    display.print("RADIO");
++    display.setCursor(0, 12);
++    if (prefs != NULL) {
++      snprintf(line, sizeof(line), "F:%.1f", prefs->freq);
++    } else {
++      snprintf(line, sizeof(line), "F:---");
++    }
++    display.print(line);
++    display.setCursor(0, 24);
++    if (prefs != NULL) {
++      snprintf(line, sizeof(line), "BW:%.0f SF:%u", prefs->bw, prefs->sf);
++    } else {
++      snprintf(line, sizeof(line), "BW:--- SF:-");
++    }
++    display.print(line);
++    display.setCursor(0, 36);
++    if (prefs != NULL) {
++      snprintf(line, sizeof(line), "P:%d CR:%u", prefs->tx_power_dbm, prefs->cr);
++    } else {
++      snprintf(line, sizeof(line), "P:-- CR:-");
++    }
++    display.print(line);
++  } else if (c6l_oled_page == 3) {
++    display.setCursor(0, 0);
++    display.print("SIGNAL");
++    display.setCursor(0, 12);
++    if (radio_driver.getPacketsRecv() == 0) {
++      display.print("RSSI:---");
++      display.setCursor(0, 24);
++      display.print("SNR:---");
++    } else {
++      snprintf(line, sizeof(line), "RSSI:%d",
++               static_cast<int>(radio_driver.getLastRSSI()));
++      display.print(line);
++      display.setCursor(0, 24);
++      snprintf(line, sizeof(line), "SNR:%.1f", radio_driver.getLastSNR());
++      display.print(line);
++    }
++    display.setCursor(0, 36);
++    snprintf(line, sizeof(line), "RX:%lu",
++             static_cast<unsigned long>(radio_driver.getPacketsRecv()));
++    display.print(line);
++  } else if (c6l_oled_page == 4) {
++    const uint32_t packets_recv = radio_driver.getPacketsRecv();
++    display.setCursor(0, 0);
++    display.print("RF MON");
++    display.setCursor(0, 9);
++    snprintf(line, sizeof(line), "NF %d", radio_driver.getNoiseFloor());
++    display.print(line);
++    display.setCursor(0, 18);
++    if (packets_recv == 0) {
++      display.print("R ---");
++      display.setCursor(0, 27);
++      display.print("S ---");
++    } else {
++      snprintf(line, sizeof(line), "R %d",
++               static_cast<int>(radio_driver.getLastRSSI()));
++      display.print(line);
++      display.setCursor(0, 27);
++      snprintf(line, sizeof(line), "S %+.1f", radio_driver.getLastSNR());
++      display.print(line);
++    }
++    display.setCursor(0, 36);
++    snprintf(line, sizeof(line), "RX %lu", static_cast<unsigned long>(packets_recv));
++    if (display.getTextWidth(line) > 64) {
++      if (packets_recv < 1000000UL) {
++        snprintf(line, sizeof(line), "RX %.1fk", packets_recv / 1000.0);
++      } else {
++        snprintf(line, sizeof(line), "RX %.1fM", packets_recv / 1000000.0);
++      }
++    }
++    display.print(line);
++  } else if (c6l_oled_page == 5) {
++    const uint32_t uptime = millis() / 1000;
++    display.setCursor(0, 0);
++    display.print("DEVICE");
++    display.setCursor(0, 12);
++    display.print("C6L");
++    display.setCursor(0, 24);
++    snprintf(line, sizeof(line), "UP:%02lu:%02lu",
++             static_cast<unsigned long>((uptime / 3600) % 100),
++             static_cast<unsigned long>((uptime / 60) % 60));
++    display.print(line);
++    display.setCursor(0, 36);
++    snprintf(line, sizeof(line), "B:%s", ble_status);
++    display.print(line);
++  } else {
++    const uint32_t timestamp = rtc_clock.getCurrentTime();
++    const time_t t = static_cast<time_t>(timestamp);
++    struct tm now = {};
++    if (timestamp < C6L_MIN_VALID_TIMESTAMP || localtime_r(&t, &now) == NULL) {
++      display.setCursor(0, 12);
++      display.print("NO TIME");
++      display.setCursor(0, 28);
++      display.print("SYNC BLE");
++    } else {
++        char clock_line[6];
++        char date_line[9];
++      snprintf(clock_line, sizeof(clock_line), "%02d:%02d", now.tm_hour, now.tm_min);
++      snprintf(date_line, sizeof(date_line), "%02d.%02d.%02d",
++               now.tm_mday, now.tm_mon + 1, (now.tm_year + 1900) % 100);
++      display.setCursor((64 - display.getTextWidth(clock_line)) / 2, 4);
++      display.print(clock_line);
++      display.setCursor((64 - display.getTextWidth(date_line)) / 2, 28);
++      display.print(date_line);
++    }
++  }
++  display.endFrame();
++}
++#endif
++
++
++#if defined(C6L_OLED_TEST) && defined(MESHCORE_DUALBOOT)
++static void c6lPlayRadioRainBoot() {
++  static constexpr char RADIO_RAIN_CHARS[] = "01ABCDEFXYZ";
++  static constexpr uint8_t COLS = 7;
++  static constexpr uint8_t TAIL = 3;
++  static constexpr uint32_t DURATION_MS = 5000;
++  static constexpr uint32_t FRAME_MS = 83;  // ~12 FPS
++
++  int16_t head[COLS];
++  uint8_t speed[COLS];
++  uint8_t seed[COLS];
++
++  uint32_t rng = micros() ^ 0xC6D00B1Eu;
++
++  auto nextRand = [&]() -> uint32_t {
++    rng = rng * 1664525u + 1013904223u;
++    return rng;
++  };
++
++  for (uint8_t i = 0; i < COLS; ++i) {
++    head[i] = -12 - static_cast<int16_t>(i * 9) - static_cast<int16_t>(nextRand() % 12);
++    speed[i] = 2 + (nextRand() % 2);
++    seed[i] = nextRand() % (sizeof(RADIO_RAIN_CHARS) - 1);
++  }
++
++  const uint32_t started = millis();
++  uint32_t frame = 0;
++  bool skip_armed = false;
++
++  while ((uint32_t)(millis() - started) < DURATION_MS) {
++    const bool pressed = board.isButtonPressed();
++
++    if (!skip_armed) {
++      if (!pressed) skip_armed = true;
++    } else if (pressed) {
++      return;
++    }
++
++    display.startFrame();
++    display.setTextSize(1);
++    display.setColor(SSD1306_WHITE);
++
++    for (uint8_t col = 0; col < COLS; ++col) {
++      const int16_t x = 3 + col * 9;
++
++      for (uint8_t tail = 0; tail < TAIL; ++tail) {
++        const int16_t y = head[col] - tail * 8;
++
++        if (y >= 0 && y <= 40) {
++          const uint8_t idx =
++              (seed[col] + tail + frame / 2 + col) %
++              (sizeof(RADIO_RAIN_CHARS) - 1);
++
++          display.setCursor(x, y);
++          char rain_char[2] = { RADIO_RAIN_CHARS[idx], '\0' };
++          display.print(rain_char);
++        }
++      }
++
++      head[col] += speed[col];
++
++      if (head[col] > 48 + TAIL * 8) {
++        head[col] = -24 - static_cast<int16_t>(nextRand() % 48);
++        speed[col] = 2 + (nextRand() % 2);
++        seed[col] = nextRand() % (sizeof(RADIO_RAIN_CHARS) - 1);
++      }
++    }
++
++    display.endFrame();
++    ++frame;
++    delay(FRAME_MS);
++  }
++}
++#endif
++
+ /* END GLOBAL OBJECTS */
+ 
+ void halt() {
+@@ -117,11 +502,28 @@ void setup() {
+   Serial.begin(115200);
+   board.begin();
+ 
++#ifdef C6L_OLED_TEST
++  c6l_buzzer.begin();
++  c6l_buzzer.startup();
++#endif
++
+ #ifdef HAS_EXTERNAL_WATCHDOG
+   external_watchdog.begin();
+ #endif
+ 
+-#ifdef DISPLAY_CLASS
++#ifdef C6L_OLED_TEST
++  if (display.begin()) {
++#if defined(MESHCORE_DUALBOOT)
++    c6lPlayRadioRainBoot();
++#else
++    updateC6LOledStatus();
++#endif
++    c6l_logo_started_ms = millis();
++    c6l_oled_last_update = c6l_logo_started_ms;
++    c6l_oled_last_activity_ms = millis();
++    c6l_oled_sleeping = false;
++  }
++#elif defined(DISPLAY_CLASS)
+   DisplayDriver* disp = NULL;
+   if (display.begin()) {
+     disp = &display;
+@@ -134,6 +536,252 @@ void setup() {
+   }
+ #endif
+ 
++#if defined(MESHCORE_DUALBOOT)
++  // C6L DualBoot menu:
++  // short USER press = change selection
++  // hold USER >= 1 s = start selected system
++  // hold USER >= 3 s = save selected system as default
++  // 10 s inactivity = start default system
++  {
++    Preferences dualboot_prefs;
++    const bool dualboot_prefs_ok =
++        dualboot_prefs.begin("c6l_dualboot", false);
++
++    uint8_t default_system =
++        dualboot_prefs_ok ? dualboot_prefs.getUChar("default", 0) : 0;
++
++    if (default_system > 1) {
++      default_system = 0;
++    }
++
++    bool select_meshtastic = (default_system == 1);
++    bool was_pressed = false;
++    bool start_hint_shown = false;
++    bool default_hint_shown = false;
++    uint32_t pressed_at = 0;
++    uint32_t last_activity = millis();
++
++    static constexpr uint32_t MENU_TIMEOUT_MS = 10000;
++
++#ifdef C6L_OLED_TEST
++    const char* menu_click_sound = "Click:d=32,o=6,b=180:32c6";
++    const char* menu_confirm_sound = "Confirm:d=32,o=6,b=180:32e6,32g6";
++
++    auto playMenuSound = [&](const char* melody, uint32_t timeout_ms) {
++      c6l_buzzer.play(melody);
++      const uint32_t started = millis();
++
++      while (c6l_buzzer.isPlaying() &&
++             (uint32_t)(millis() - started) < timeout_ms) {
++        c6l_buzzer.loop();
++        delay(1);
++      }
++    };
++#endif
++
++    auto drawDualBootMenu = [&]() {
++#ifdef C6L_OLED_TEST
++      display.startFrame();
++      display.setTextSize(1);
++      display.setColor(SSD1306_WHITE);
++
++      display.setCursor(0, 0);
++      display.print("DUAL BOOT");
++
++      display.setCursor(0, 13);
++      display.print(select_meshtastic ? "  MeshCore" : "> MeshCore");
++
++      display.setCursor(0, 25);
++      display.print(select_meshtastic ? "> Meshtastic" : "  Meshtastic");
++
++      display.setCursor(0, 38);
++      display.print(default_system == 1 ? "DEF: MT" : "DEF: MC");
++
++      display.endFrame();
++
++#elif defined(DISPLAY_CLASS)
++      if (disp != NULL) {
++        disp->startFrame();
++        disp->setTextSize(1);
++        disp->drawTextCentered(disp->width() / 2, 4, "C6L DualBoot");
++        disp->drawTextCentered(
++            disp->width() / 2, 22,
++            select_meshtastic ? "  MeshCore" : "> MeshCore");
++        disp->drawTextCentered(
++            disp->width() / 2, 36,
++            select_meshtastic ? "> Meshtastic" : "  Meshtastic");
++        disp->endFrame();
++      }
++#endif
++    };
++
++    auto drawHoldHint = [&](const char* hint) {
++#ifdef C6L_OLED_TEST
++      display.startFrame();
++      display.setTextSize(1);
++      display.setColor(SSD1306_WHITE);
++
++      display.setCursor(0, 0);
++      display.print("DUAL BOOT");
++
++      display.setCursor(0, 13);
++      display.print(select_meshtastic ? "  MeshCore" : "> MeshCore");
++
++      display.setCursor(0, 25);
++      display.print(select_meshtastic ? "> Meshtastic" : "  Meshtastic");
++
++      display.setCursor(0, 38);
++      display.print(hint);
++
++      display.endFrame();
++#endif
++    };
++
++    // Ignoruj stan USER trzymany jeszcze podczas startu.
++    while (board.isButtonPressed()) {
++      delay(10);
++    }
++
++    last_activity = millis();
++    drawDualBootMenu();
++
++    while (true) {
++      const bool pressed = board.isButtonPressed();
++      const uint32_t now = millis();
++
++      // 10 sekund bezczynnosci -> system domyslny.
++      if (!pressed &&
++          (uint32_t)(now - last_activity) >= MENU_TIMEOUT_MS) {
++
++        select_meshtastic = (default_system == 1);
++
++        if (dualboot_prefs_ok) {
++          dualboot_prefs.end();
++        }
++
++        if (select_meshtastic) {
++          configureDualBootNextPartition();
++          delay(150);
++          ESP.restart();
++
++          while (true) {
++            delay(1000);
++          }
++        } else {
++          break;
++        }
++      }
++
++      if (pressed && !was_pressed) {
++        pressed_at = now;
++        last_activity = now;
++        start_hint_shown = false;
++        default_hint_shown = false;
++      }
++
++      if (pressed) {
++        const uint32_t held_now = now - pressed_at;
++
++        // 1-3 s = uruchom zaznaczony system
++        if (held_now >= 1000 &&
++            held_now < 3000 &&
++            !start_hint_shown) {
++
++          start_hint_shown = true;
++
++#ifdef C6L_OLED_TEST
++          playMenuSound(menu_click_sound, 100);
++          drawHoldHint(
++              select_meshtastic ? "START: MT" : "START: MC");
++#endif
++        }
++
++        // >= 3 s = ustaw zaznaczony jako domyslny
++        if (held_now >= 3000 &&
++            !default_hint_shown) {
++
++          default_hint_shown = true;
++
++#ifdef C6L_OLED_TEST
++          playMenuSound(menu_confirm_sound, 160);
++          drawHoldHint(
++              select_meshtastic ? "SET DEF: MT" : "SET DEF: MC");
++#endif
++        }
++      }
++
++      if (!pressed && was_pressed) {
++        const uint32_t held_ms = now - pressed_at;
++        last_activity = now;
++
++        // >= 4 s: zapisz zaznaczony system jako domyslny.
++        if (held_ms >= 3000) {
++          const uint8_t new_default = select_meshtastic ? 1 : 0;
++          bool saved = false;
++
++          if (dualboot_prefs_ok) {
++            saved =
++                dualboot_prefs.putUChar("default", new_default) == 1;
++          }
++
++          if (saved) {
++            default_system = new_default;
++
++#ifdef C6L_OLED_TEST
++            playMenuSound(menu_confirm_sound, 200);
++#endif
++          } else {
++            Serial.println("DUALBOOT: default system save failed");
++          }
++
++          drawDualBootMenu();
++
++        // >= 1 s: uruchom zaznaczony system.
++        } else if (held_ms >= 1000) {
++
++#ifdef C6L_OLED_TEST
++          playMenuSound(menu_confirm_sound, 200);
++#endif
++
++          if (select_meshtastic) {
++            if (dualboot_prefs_ok) {
++              dualboot_prefs.end();
++            }
++
++            configureDualBootNextPartition();
++            delay(150);
++            ESP.restart();
++
++            while (true) {
++              delay(1000);
++            }
++
++          } else {
++            if (dualboot_prefs_ok) {
++              dualboot_prefs.end();
++            }
++
++            break;
++          }
++
++        // Krotkie nacisniecie: zmiana zaznaczenia.
++        } else if (held_ms >= 50) {
++          select_meshtastic = !select_meshtastic;
++
++#ifdef C6L_OLED_TEST
++          playMenuSound(menu_click_sound, 120);
++#endif
++
++          drawDualBootMenu();
++        }
++      }
++
++      was_pressed = pressed;
++      delay(10);
++    }
++  }
++#endif
++
+   if (!radio_init()) { halt(); }
+ 
+   fast_rng.begin(radio_driver.getRngSeed());
+@@ -171,7 +819,11 @@ void setup() {
+     #endif
+   );
+ #elif defined(ESP32)
+-  SPIFFS.begin(true);
++  #if defined(MESHCORE_DUALBOOT)
++    SPIFFS.begin(true, "/spiffs", 10, "mc_spiffs");
++  #else
++    SPIFFS.begin(true);
++  #endif
+   store.begin();
+   the_mesh.begin(
+     #ifdef DISPLAY_CLASS
+@@ -185,6 +837,11 @@ void setup() {
+ #endif
+ 
+ // add bluetooth interface
++#ifdef C6L_OLED_TEST
++  if (!c6l_applyTimezone(the_mesh.getNodePrefs()->c6l_timezone)) {
++    c6l_applyTimezone(0);  // Best-effort UTC fallback; errors are logged.
++  }
++#endif
+ #if defined(BLE_PIN_CODE)
+   bluetooth_interface.begin(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
+   interface_manager.addInterface(InterfaceType::Bluetooth, &bluetooth_interface);
+@@ -242,12 +899,143 @@ void setup() {
+ #endif
+ 
+   board.onBootComplete();
++#ifdef C6L_OLED_TEST
++  updateC6LOledStatus();
++  c6l_rx_baseline = radio_driver.getPacketsRecv();
++  c6l_tx_baseline = radio_driver.getPacketsSent();
++  c6l_setBleLed();
++#endif
+ }
+ 
+ void loop() {
+   the_mesh.loop();
+   interface_manager.loop();
+   sensors.loop();
++#ifdef C6L_OLED_TEST
++  c6l_updateLed();
++  if (c6l_buzzer.isPlaying()) c6l_buzzer.loop();
++  const bool pairing_was_visible = c6l_pairing_visible;
++  const bool pairing_changed = bluetooth_interface.readPairingDisplayEvent(c6l_pairing);
++  const uint32_t pairing_now = millis();
++  if (c6l_pairing.active) {
++    c6l_timezone_mode = false;  // Discard any unconfirmed selection before handling P0.
++    c6l_clock_press = false;
++    c6l_button_consumed = true;
++  }
++  if (c6l_pairing.active &&
++      (uint32_t)(pairing_now - c6l_pairing.timestamp_ms) >= C6L_PAIRING_TIMEOUT_MS) {
++    c6l_pairing.active = false;  // UI timeout only; do not change BLE state.
++  }
++  if (!c6l_boot_logo_done &&
++      (uint32_t)(pairing_now - c6l_logo_started_ms) >= C6L_BOOT_LOGO_MS) {
++    c6l_boot_logo_done = true;
++  }
++  if (c6l_boot_logo_done && c6l_pairing.active && !c6l_pairing_visible) {
++    c6l_pairing_was_sleeping = c6l_oled_sleeping;
++    c6l_pairing_shown_ms = pairing_now;
++    c6l_pairing_visible = true;
++    if (c6l_oled_sleeping) display.wake();
++    c6l_oled_sleeping = false;
++  } else if (c6l_pairing_visible && !c6l_pairing.active) {
++    c6l_pairing_visible = false;
++    // Pause the normal auto-off countdown while the overlay is visible.
++    c6l_oled_last_activity_ms += (uint32_t)(pairing_now - c6l_pairing_shown_ms);
++    c6l_oled_sleeping = c6l_pairing_was_sleeping;
++    updateC6LOledStatus();  // Restore the unchanged normal page, removing the PIN.
++    if (c6l_oled_sleeping) display.sleep();
++    c6l_oled_last_update = pairing_now;
++  }
++  if (c6l_pairing_visible && (!pairing_was_visible || pairing_changed)) {
++    updateC6LOledStatus();
++    c6l_oled_last_update = pairing_now;
++  }
++  const bool button_pressed = board.isButtonPressed();
++  const uint32_t button_now = millis();
++  bool ui_changed = false;
++  if (!c6l_boot_logo_done || c6l_pairing.active || c6l_pairing_visible || pairing_was_visible) {
++    c6l_clock_press = false;
++    c6l_button_consumed = true;
++  } else if (c6l_button_consumed) {
++    if (!button_pressed) c6l_button_consumed = false;
++  } else {
++    if (button_pressed && !c6l_button_was_pressed) {
++      c6l_oled_last_activity_ms = button_now;
++      c6l_timezone_activity = button_now;
++      if (c6l_oled_sleeping) {
++        display.wake();
++        c6l_oled_sleeping = false;
++        c6l_button_consumed = true;
++        ui_changed = true;
++      } else if (c6l_oled_page == C6L_CLOCK_PAGE) {
++        c6l_clock_press = true;
++        c6l_clock_pressed_ms = button_now;
++      } else {
++        c6l_oled_page = (c6l_oled_page + 1) % C6L_PAGE_COUNT;
++        ui_changed = true;
++      }
++    }
++    if (c6l_clock_press) {
++      const uint32_t duration = button_now - c6l_clock_pressed_ms;
++      if (duration >= 3000) {
++        c6l_clock_press = false;
++        c6l_button_consumed = true;
++        c6l_timezone_activity = button_now;
++        if (!c6l_timezone_mode) {
++          c6l_timezone_choice = c6l_validTimezone(the_mesh.getNodePrefs()->c6l_timezone);
++          c6l_timezone_error = false;
++          c6l_timezone_mode = true;
++        } else {
++          NodePrefs* prefs = the_mesh.getNodePrefs();
++          if (c6l_timezone_choice == prefs->c6l_timezone && !c6l_timezone_error) {
++            c6l_timezone_mode = false;
++          } else if (c6l_applyTimezone(c6l_timezone_choice)) {
++            prefs->c6l_timezone = c6l_timezone_choice;
++            const bool saved = the_mesh.savePrefs();
++            c6l_timezone_error = !saved;
++            c6l_timezone_mode = !saved;
++          } else {
++            c6l_timezone_error = true;
++          }
++        }
++        ui_changed = true;
++      } else if (!button_pressed) {
++        c6l_clock_press = false;
++        c6l_timezone_activity = button_now;
++        if (c6l_timezone_mode) {
++          c6l_timezone_choice = (c6l_timezone_choice + 1) % C6L_TZ_COUNT;
++          c6l_timezone_error = false;
++        } else {
++          c6l_oled_page = 0;
++        }
++        ui_changed = true;
++      }
++    }
++  }
++  if (c6l_timezone_mode && !button_pressed && !c6l_clock_press &&
++      (uint32_t)(button_now - c6l_timezone_activity) >= 30000) {
++    c6l_timezone_mode = false;
++    ui_changed = true;
++  }
++  if (ui_changed) {
++      updateC6LOledStatus();
++      c6l_oled_last_update = button_now;
++  }
++  c6l_button_was_pressed = button_pressed;
++  const uint32_t now = millis();
++  if (!c6l_oled_sleeping && !c6l_pairing_visible && c6l_oled_page != C6L_CLOCK_PAGE &&
++      (uint32_t)(now - c6l_oled_last_activity_ms) >= C6L_OLED_TIMEOUT_MS) {
++    display.sleep();
++    c6l_oled_sleeping = true;
++  }
++  const uint32_t refresh_interval = !c6l_pairing_visible && c6l_oled_page == C6L_CLOCK_PAGE ? 1000 : 750;
++  if (!c6l_oled_sleeping && c6l_boot_logo_done && (c6l_pairing_visible || c6l_oled_page != 0) &&
++      now - c6l_oled_last_update >= refresh_interval) {
++    updateC6LOledStatus();
++    c6l_oled_last_update = now;
++  }
++
++
++#endif
+ #ifdef DISPLAY_CLASS
+   ui_task.loop();
+ #endif
+@@ -272,3 +1060,4 @@ void loop() {
+   }
+ #endif
+ }
++
+diff --git a/src/helpers/esp32/DualBoot.cpp b/src/helpers/esp32/DualBoot.cpp
+new file mode 100644
+index 00000000..a906b4be
+--- /dev/null
++++ b/src/helpers/esp32/DualBoot.cpp
+@@ -0,0 +1,46 @@
++#include "DualBoot.h"
++
++#if defined(ESP32) && defined(MESHCORE_DUALBOOT)
++
++#include <Arduino.h>
++#include <esp_partition.h>
++#include <esp_ota_ops.h>
++
++void configureDualBootNextPartition() {
++  const esp_partition_t* running = esp_ota_get_running_partition();
++  if (running == nullptr) {
++    Serial.println("DUALBOOT: running partition unavailable; keeping current system");
++    return;
++  }
++
++  esp_partition_subtype_t target_subtype;
++  if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) {
++    target_subtype = ESP_PARTITION_SUBTYPE_APP_OTA_1;
++  } else if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) {
++    target_subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0;
++  } else {
++    Serial.printf("DUALBOOT: unsupported running subtype 0x%02x; keeping current system\n",
++                  running->subtype);
++    return;
++  }
++
++  const esp_partition_t* target = esp_partition_find_first(
++      ESP_PARTITION_TYPE_APP, target_subtype, nullptr);
++  if (target == nullptr) {
++    Serial.printf("DUALBOOT: target for running %s is missing; keeping current system\n",
++                  running->label);
++    return;
++  }
++
++  Serial.printf("DUALBOOT: running=%s target=%s\n", running->label, target->label);
++  const esp_err_t result = esp_ota_set_boot_partition(target);
++  if (result != ESP_OK) {
++    Serial.printf("DUALBOOT: cannot set %s as next boot: %s (0x%x); continuing\n",
++                  target->label, esp_err_to_name(result), result);
++    return;
++  }
++
++  Serial.printf("DUALBOOT: next boot set to %s; no restart requested\n", target->label);
++}
++
++#endif
+\ No newline at end of file
+diff --git a/src/helpers/esp32/DualBoot.h b/src/helpers/esp32/DualBoot.h
+new file mode 100644
+index 00000000..cec1080a
+--- /dev/null
++++ b/src/helpers/esp32/DualBoot.h
+@@ -0,0 +1,5 @@
++#pragma once
++
++#if defined(ESP32)
++void configureDualBootNextPartition();
++#endif
+\ No newline at end of file
+diff --git a/src/helpers/esp32/SerialBLEInterface.cpp b/src/helpers/esp32/SerialBLEInterface.cpp
+index 6371cf33..52c5daec 100644
+--- a/src/helpers/esp32/SerialBLEInterface.cpp
++++ b/src/helpers/esp32/SerialBLEInterface.cpp
+@@ -55,12 +55,22 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
+ 
+ // -------- BLESecurityCallbacks methods
+ 
++#ifdef C6L_OLED_TEST
++void SerialBLEInterface::publishPairingDisplayState(bool active, uint32_t pass_key) {
++  const PairingDisplayEvent event = {active, pass_key, millis()};
++  xQueueOverwrite(pairing_queue, &event);
++}
++#endif
++
+ uint32_t SerialBLEInterface::onPassKeyRequest() {
+   BLE_DEBUG_PRINTLN("onPassKeyRequest()");
+   return _pin_code;
+ }
+ 
+ void SerialBLEInterface::onPassKeyNotify(uint32_t pass_key) {
++#ifdef C6L_OLED_TEST
++  publishPairingDisplayState(true, pass_key);
++#endif
+   BLE_DEBUG_PRINTLN("onPassKeyNotify(%u)", pass_key);
+ }
+ 
+@@ -75,6 +85,9 @@ bool SerialBLEInterface::onSecurityRequest() {
+ }
+ 
+ void SerialBLEInterface::onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
++#ifdef C6L_OLED_TEST
++  publishPairingDisplayState(false);
++#endif
+   if (cmpl.success) {
+     BLE_DEBUG_PRINTLN(" - SecurityCallback - Authentication Success");
+     deviceConnected = true;
+@@ -102,6 +115,9 @@ void SerialBLEInterface::onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param
+ }
+ 
+ void SerialBLEInterface::onDisconnect(BLEServer* pServer) {
++#ifdef C6L_OLED_TEST
++  publishPairingDisplayState(false);
++#endif
+   BLE_DEBUG_PRINTLN("onDisconnect()");
+   deviceConnected = false;
+   if (_isEnabled) {
+diff --git a/src/helpers/esp32/SerialBLEInterface.h b/src/helpers/esp32/SerialBLEInterface.h
+index 9fb6adba..b8d85eff 100644
+--- a/src/helpers/esp32/SerialBLEInterface.h
++++ b/src/helpers/esp32/SerialBLEInterface.h
+@@ -9,6 +9,20 @@
+ #include <freertos/queue.h>
+ 
+ class SerialBLEInterface : public BaseSerialInterface, BLESecurityCallbacks, BLEServerCallbacks, BLECharacteristicCallbacks {
++#ifdef C6L_OLED_TEST
++public:
++  struct PairingDisplayEvent {
++    bool active;
++    uint32_t pass_key;
++    uint32_t timestamp_ms;
++  };
++private:
++  // Latest state wins: completion must replace any unconsumed PIN notification.
++  StaticQueue_t pairing_queue_state;
++  uint8_t pairing_queue_storage[sizeof(PairingDisplayEvent)];
++  QueueHandle_t pairing_queue;
++  void publishPairingDisplayState(bool active, uint32_t pass_key = 0);
++#endif
+   BLEServer *pServer;
+   BLEService *pService;
+   BLECharacteristic * pTxCharacteristic;
+@@ -65,8 +79,18 @@ public:
+       FRAME_QUEUE_SIZE, sizeof(Frame), recv_queue_storage, &recv_queue_state
+     );
+     send_queue_len = 0;
++#ifdef C6L_OLED_TEST
++    pairing_queue = xQueueCreateStatic(1, sizeof(PairingDisplayEvent),
++                                      pairing_queue_storage, &pairing_queue_state);
++#endif
+   }
+ 
++#ifdef C6L_OLED_TEST
++  bool readPairingDisplayEvent(PairingDisplayEvent& event) {
++    return xQueueReceive(pairing_queue, &event, 0) == pdTRUE;
++  }
++#endif
++
+   /**
+    * init the BLE interface.
+    * @param prefix   a prefix for the device name
+diff --git a/test/test_dualboot_partition.py b/test/test_dualboot_partition.py
+new file mode 100644
+index 00000000..1fc4b88c
+--- /dev/null
++++ b/test/test_dualboot_partition.py
+@@ -0,0 +1,82 @@
++from pathlib import Path
++import csv
++import sys
++
++FLASH_SIZE = 0x1000000
++APP_ALIGNMENT = 0x10000
++DATA_ALIGNMENT = 0x1000
++
++
++def parse_table(path):
++    partitions = []
++    with path.open(newline="") as stream:
++        for row in csv.reader(line for line in stream if not line.lstrip().startswith("#")):
++            if not row or not row[0].strip():
++                continue
++            name, kind, subtype, offset, size, *_ = [field.strip() for field in row]
++            partitions.append((name, kind, subtype, int(offset, 0), int(size, 0)))
++    return partitions
++
++
++def check(path):
++    partitions = parse_table(path)
++    by_name = {partition[0]: partition for partition in partitions}
++    assert len(by_name) == len(partitions), "duplicate partition name"
++
++    ranges = []
++    for name, kind, subtype, offset, size in partitions:
++        assert size > 0, f"{name}: non-positive size"
++        end = offset + size
++        assert end <= FLASH_SIZE, f"{name}: exceeds 16 MB flash"
++        alignment = APP_ALIGNMENT if kind == "app" else DATA_ALIGNMENT
++        assert offset % alignment == 0, f"{name}: offset alignment"
++        assert size % alignment == 0, f"{name}: size alignment"
++        ranges.append((offset, end, name))
++
++    ranges.sort()
++    for previous, current in zip(ranges, ranges[1:]):
++        assert previous[1] <= current[0], f"overlap: {previous[2]} and {current[2]}"
++
++    for name, kind, subtype, expected_subtype in (
++        ("app0", "app", "ota_0", "ota_0"),
++        ("app1", "app", "ota_1", "ota_1"),
++    ):
++        partition = by_name[name]
++        assert partition[1:3] == (kind, expected_subtype), f"{name}: wrong type/subtype"
++        assert partition[4] == 0x640000, f"{name}: wrong slot size"
++
++    ordered = ["app0", "app1", "spiffs", "mc_spiffs", "coredump"]
++    for first, second in zip(ordered, ordered[1:]):
++        assert by_name[first][3] + by_name[first][4] <= by_name[second][3], \
++            f"ordering: {first} must end before {second}"
++    assert ranges[-1][1] <= FLASH_SIZE
++
++    print(f"PASS: {path}")
++    for name, kind, subtype, offset, size in partitions:
++        print(f"  {name}: 0x{offset:06X}-0x{offset + size:06X} ({size:#x})")
++
++
++def check_boot_helper(path):
++    source = path.read_text()
++    required = (
++        "esp_ota_get_running_partition",
++        "esp_partition_find_first",
++        "esp_ota_set_boot_partition",
++        "ESP_PARTITION_SUBTYPE_APP_OTA_0",
++        "ESP_PARTITION_SUBTYPE_APP_OTA_1",
++    )
++    for token in required:
++        assert token in source, f"boot helper missing {token}"
++    assert "esp_restart" not in source, "boot helper must not restart"
++    print(f"PASS: {path} boot contract")
++
++
++if __name__ == "__main__":
++    table = Path(__file__).parents[1] / "variants" / "m5stack_unit_c6l" / "dualboot_c6l_16MB.csv"
++    helper = Path(__file__).parents[1] / "src" / "helpers" / "esp32" / "DualBoot.cpp"
++    try:
++        check(table)
++        check_boot_helper(helper)
++    except (AssertionError, OSError, ValueError) as error:
++        print(f"FAIL: {error}", file=sys.stderr)
++        raise SystemExit(1)
+\ No newline at end of file
+diff --git a/variants/m5stack_unit_c6l/UnitC6LBoard.cpp b/variants/m5stack_unit_c6l/UnitC6LBoard.cpp
+index ab192ebe..1d86aa43 100644
+--- a/variants/m5stack_unit_c6l/UnitC6LBoard.cpp
++++ b/variants/m5stack_unit_c6l/UnitC6LBoard.cpp
+@@ -3,9 +3,56 @@
+ 
+ UnitC6LBoard board;
+ 
++SPIClass c6l_spi(0);
++
++namespace {
++constexpr uint8_t C6L_IO_ADDRESS = 0x43;
++constexpr uint8_t C6L_IO_INPUT = 0x0F;
++constexpr uint8_t C6L_IO_CONFIG = 0x03;
++constexpr uint8_t C6L_IO_OUTPUT = 0x05;
++constexpr uint8_t C6L_IO_HIGH_IMPEDANCE = 0x07;
++constexpr uint8_t C6L_IO_PULL_ENABLE = 0x0B;
++constexpr uint8_t C6L_IO_PULL_SELECT = 0x0D;
++constexpr uint8_t C6L_IO_ID = 0x01;
++constexpr uint8_t C6L_BUTTON_MASK = 1 << 0;
++constexpr uint8_t C6L_LNA_MASK = 1 << 5;
++constexpr uint8_t C6L_ANT_MASK = 1 << 6;
++constexpr uint8_t C6L_RESET_MASK = 1 << 7;
++constexpr uint8_t C6L_RF_MASK = C6L_LNA_MASK | C6L_ANT_MASK | C6L_RESET_MASK;
++constexpr int C6L_OLED_CS = 6;
++constexpr uint32_t C6L_BUTTON_DEBOUNCE_MS = 40;
++bool c6l_rf_ready = false;
++
++bool readExpanderRegister(uint8_t reg, uint8_t& value) {
++  Wire.beginTransmission(C6L_IO_ADDRESS);
++  Wire.write(reg);
++  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(C6L_IO_ADDRESS, 1) != 1) {
++    return false;
++  }
++  value = Wire.read();
++  return true;
++}
++
++bool updateExpanderRegister(uint8_t reg, uint8_t mask, uint8_t value) {
++  uint8_t current;
++  if (!readExpanderRegister(reg, current)) return false;
++  Wire.beginTransmission(C6L_IO_ADDRESS);
++  Wire.write(reg);
++  Wire.write((current & ~mask) | (value & mask));
++  return Wire.endTransmission() == 0;
++}
++}
++
++#if defined(DISPLAY_CLASS) || defined(C6L_OLED_TEST)
++  #ifdef DISPLAY_CLASS
++    DISPLAY_CLASS display;
++  #else
++    UnitC6LOLEDDisplay display;
++  #endif
++#endif
++
+ #if defined(P_LORA_SCLK)
+-  static SPIClass spi(0);
+-  RADIO_CLASS radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY, spi);
++  RADIO_CLASS radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY, c6l_spi);
+ #else
+   RADIO_CLASS radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY);
+ #endif
+@@ -16,13 +63,96 @@ ESP32RTCClock fallback_clock;
+ AutoDiscoverRTCClock rtc_clock(fallback_clock);
+ SensorManager sensors;
+ 
++void UnitC6LBoard::begin() {
++  ESP32Board::begin();
++  pinMode(C6L_OLED_CS, OUTPUT);
++  digitalWrite(C6L_OLED_CS, HIGH);
++  pinMode(P_LORA_NSS, OUTPUT);
++  digitalWrite(P_LORA_NSS, HIGH);
++  c6l_spi.begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
++  c6l_rf_ready = false;
++  expanderReady = readExpanderRegister(C6L_IO_ID, expanderId) &&
++      updateExpanderRegister(C6L_IO_CONFIG, C6L_BUTTON_MASK, 0) &&
++      updateExpanderRegister(C6L_IO_HIGH_IMPEDANCE, C6L_BUTTON_MASK, 0) &&
++      updateExpanderRegister(C6L_IO_PULL_ENABLE, C6L_BUTTON_MASK, C6L_BUTTON_MASK) &&
++      updateExpanderRegister(C6L_IO_PULL_SELECT, C6L_BUTTON_MASK, C6L_BUTTON_MASK);
++  if (!expanderReady) {
++    Serial.println("ERROR: C6L IO expander initialization failed");
++    return;
++  }
++
++  // Preload LOW before enabling the RF outputs; preserve P0 and all other bits.
++  if (!updateExpanderRegister(C6L_IO_OUTPUT, C6L_RF_MASK, 0) ||
++      !updateExpanderRegister(C6L_IO_CONFIG, C6L_RF_MASK, C6L_RF_MASK) ||
++      !updateExpanderRegister(C6L_IO_HIGH_IMPEDANCE, C6L_RF_MASK, 0)) {
++    Serial.println("ERROR: C6L RF expander configuration failed");
++    return;
++  }
++
++  // M5Stack sequence: SX_NRST LOW for 100 ms, HIGH, antenna switch ON, LNA ON.
++  delay(100);
++  if (!updateExpanderRegister(C6L_IO_OUTPUT, C6L_RESET_MASK, C6L_RESET_MASK) ||
++      !updateExpanderRegister(C6L_IO_OUTPUT, C6L_ANT_MASK, C6L_ANT_MASK) ||
++      !updateExpanderRegister(C6L_IO_OUTPUT, C6L_LNA_MASK, C6L_LNA_MASK)) {
++    Serial.println("ERROR: C6L RF reset/enable sequence failed");
++    return;
++  }
++  c6l_rf_ready = true;
++}
++
++bool UnitC6LBoard::isButtonPressed() {
++  if (!expanderReady) return false;
++  uint8_t input;
++  if (!readExpanderRegister(C6L_IO_INPUT, input)) return buttonStable;
++
++  const bool rawPressed = (input & C6L_BUTTON_MASK) == 0;
++  const uint32_t now = millis();
++  if (rawPressed != buttonLastRaw) {
++    buttonLastRaw = rawPressed;
++    buttonChangedAt = now;
++  } else if (rawPressed != buttonStable && now - buttonChangedAt >= C6L_BUTTON_DEBOUNCE_MS) {
++    buttonStable = rawPressed;
++  }
++  return buttonStable;
++}
++
++bool UnitC6LBoard::readButtonRawLevel(bool& level) {
++  if (!expanderReady) return false;
++
++  uint8_t input;
++  if (!readExpanderRegister(C6L_IO_INPUT, input)) return false;
++
++  level = (input & C6L_BUTTON_MASK) != 0;
++  return true;
++}
++
++bool UnitC6LBoard::readButtonDiagnostics(bool& level, uint8_t& id) {
++  if (!readExpanderRegister(C6L_IO_ID, id)) return false;
++  uint8_t input;
++  if (!readExpanderRegister(C6L_IO_INPUT, input)) return false;
++
++  level = (input & C6L_BUTTON_MASK) != 0;
++  return true;
++}
++
++void UnitC6LBoard::onBootComplete() {
++#if defined(P_LORA_TX_NEOPIXEL_LED)
++  setStatusLed(0, 32, 0);
++  delay(150);
++  setStatusLed(0, 0, 0);
++#endif
++}
++
+ bool radio_init() {
++  if (!c6l_rf_ready) {
++    Serial.println("ERROR: C6L RF hardware not initialized");
++    return false;
++  }
+   fallback_clock.begin();
+   rtc_clock.begin(Wire);
+ 
+ #if defined(P_LORA_SCLK)
+-  spi.begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
+-  return radio.std_init(&spi);
++  return radio.std_init(&c6l_spi);
+ #else
+   return radio.std_init();
+ #endif
+@@ -32,4 +162,3 @@ mesh::LocalIdentity radio_new_identity() {
+   RadioNoiseListener rng(radio);
+   return mesh::LocalIdentity(&rng);  // create new random identity
+ }
+-
+diff --git a/variants/m5stack_unit_c6l/UnitC6LBoard.h b/variants/m5stack_unit_c6l/UnitC6LBoard.h
+index a4ea3ee6..8b99d799 100644
+--- a/variants/m5stack_unit_c6l/UnitC6LBoard.h
++++ b/variants/m5stack_unit_c6l/UnitC6LBoard.h
+@@ -1,15 +1,34 @@
+ #pragma once
+ 
+ #include <Arduino.h>
++#include <SPI.h>
++#include <Wire.h>
+ #include <helpers/ESP32Board.h>
+ 
++extern SPIClass c6l_spi;
++
+ class UnitC6LBoard : public ESP32Board {
+ public:
+-  void begin() {
+-    ESP32Board::begin();
++  void begin();
++  void onBootComplete() override;
++  bool isButtonPressed();
++  bool readButtonRawLevel(bool& level);
++  bool readButtonDiagnostics(bool& level, uint8_t& id);
++
++#if defined(P_LORA_TX_NEOPIXEL_LED)
++  void setStatusLed(uint8_t red, uint8_t green, uint8_t blue) {
++    neopixelWrite(P_LORA_TX_NEOPIXEL_LED, red, green, blue);
+   }
++#endif
+ 
+   const char* getManufacturerName() const override {
+     return "Unit C6L";
+   }
++
++private:
++  bool expanderReady = false;
++  bool buttonStable = false;
++  bool buttonLastRaw = false;
++  uint32_t buttonChangedAt = 0;
++  uint8_t expanderId = 0;
+ };
+diff --git a/variants/m5stack_unit_c6l/UnitC6LOLEDDisplay.cpp b/variants/m5stack_unit_c6l/UnitC6LOLEDDisplay.cpp
+new file mode 100644
+index 00000000..947b7353
+--- /dev/null
++++ b/variants/m5stack_unit_c6l/UnitC6LOLEDDisplay.cpp
+@@ -0,0 +1,119 @@
++#include "UnitC6LOLEDDisplay.h"
++
++#include "UnitC6LBoard.h"
++
++ColorVal UIColor::window_bkg = BLACK;
++ColorVal UIColor::title_bkg = BLACK;
++ColorVal UIColor::title_txt = WHITE;
++ColorVal UIColor::primary_txt = WHITE;
++ColorVal UIColor::secondary_txt = WHITE;
++ColorVal UIColor::warning_txt = WHITE;
++ColorVal UIColor::popup_bkg = BLACK;
++ColorVal UIColor::popup_txt = WHITE;
++ColorVal UIColor::corp_blue = WHITE;
++
++namespace {
++constexpr int OLED_DC = 18;
++constexpr int OLED_RESET = 15;
++constexpr int OLED_CS = 6;
++}
++
++UnitC6LOLEDDisplay::UnitC6LOLEDDisplay()
++    : DisplayDriver(64, 48),
++      display(OLED_RESET, OLED_DC, OLED_CS, GEOMETRY_64_48),
++      _isOn(false),
++      _color(WHITE),
++      _cursorX(0),
++      _cursorY(0) {}
++
++bool UnitC6LOLEDDisplay::begin() {
++  if (_isOn) return true;
++
++  display.setHorizontalOffset(32);
++  _isOn = display.init();
++  if (_isOn) {
++    display.setFont(ArialMT_Plain_10);
++    display.clear();
++    display.display();
++  }
++  return _isOn;
++}
++
++void UnitC6LOLEDDisplay::sleep() {
++  if (_isOn) {
++    display.displayOff();
++    _isOn = false;
++  }
++}
++
++void UnitC6LOLEDDisplay::wake() {
++  if (!_isOn) {
++    display.displayOn();
++    _isOn = true;
++  }
++}
++
++void UnitC6LOLEDDisplay::turnOn() {
++  if (!_isOn && !begin()) return;
++  display.displayOn();
++}
++
++void UnitC6LOLEDDisplay::turnOff() {
++  display.displayOff();
++  _isOn = false;
++}
++
++void UnitC6LOLEDDisplay::clear() {
++  display.clear();
++  display.display();
++}
++
++void UnitC6LOLEDDisplay::startFrame(ColorVal bkg) {
++  display.clear();
++  _color = WHITE;
++  display.setColor(_color ? WHITE : BLACK);
++  display.setFont(ArialMT_Plain_10);
++  _cursorX = 0;
++  _cursorY = 0;
++}
++
++void UnitC6LOLEDDisplay::setTextSize(int sz) {
++  (void)sz;
++}
++
++void UnitC6LOLEDDisplay::setColor(ColorVal c) {
++  _color = c;
++  display.setColor(_color ? WHITE : BLACK);
++}
++
++void UnitC6LOLEDDisplay::setCursor(int x, int y) {
++  _cursorX = x;
++  _cursorY = y;
++}
++
++void UnitC6LOLEDDisplay::print(const char* str) {
++  display.drawString(_cursorX, _cursorY, String(str));
++}
++
++void UnitC6LOLEDDisplay::fillRect(int x, int y, int w, int h) {
++  display.setColor(_color ? WHITE : BLACK);
++  display.fillRect(x, y, w, h);
++}
++
++void UnitC6LOLEDDisplay::drawRect(int x, int y, int w, int h) {
++  display.setColor(_color ? WHITE : BLACK);
++  display.drawRect(x, y, w, h);
++}
++
++void UnitC6LOLEDDisplay::drawXbm(int x, int y, const uint8_t* bits, int w, int h) {
++  display.setColor(_color ? WHITE : BLACK);
++  display.drawXbm(x, y, w, h, bits);
++}
++
++uint16_t UnitC6LOLEDDisplay::getTextWidth(const char* str) {
++  return display.getStringWidth(str);
++}
++
++void UnitC6LOLEDDisplay::endFrame() {
++  display.display();
++}
+diff --git a/variants/m5stack_unit_c6l/UnitC6LOLEDDisplay.h b/variants/m5stack_unit_c6l/UnitC6LOLEDDisplay.h
+new file mode 100644
+index 00000000..fa8a8015
+--- /dev/null
++++ b/variants/m5stack_unit_c6l/UnitC6LOLEDDisplay.h
+@@ -0,0 +1,40 @@
++#pragma once
++
++#include <SPI.h>
++extern SPIClass c6l_spi;
++#define SPI c6l_spi
++#include <SSD1306Spi.h>
++#undef SPI
++#include <helpers/ui/DisplayDriver.h>
++
++#define SSD1306_BLACK BLACK
++#define SSD1306_WHITE WHITE
++
++class UnitC6LOLEDDisplay : public DisplayDriver {
++  SSD1306Spi display;
++  bool _isOn;
++  uint8_t _color;
++  int _cursorX;
++  int _cursorY;
++
++public:
++  UnitC6LOLEDDisplay();
++
++  bool begin();
++  void sleep();
++  void wake();
++  bool isOn() override { return _isOn; }
++  void turnOn() override;
++  void turnOff() override;
++  void clear() override;
++  void startFrame(ColorVal bkg = UIColor::window_bkg) override;
++  void setTextSize(int sz) override;
++  void setColor(ColorVal c) override;
++  void setCursor(int x, int y) override;
++  void print(const char* str) override;
++  void fillRect(int x, int y, int w, int h) override;
++  void drawRect(int x, int y, int w, int h) override;
++  void drawXbm(int x, int y, const uint8_t* bits, int w, int h) override;
++  uint16_t getTextWidth(const char* str) override;
++  void endFrame() override;
++};
+diff --git a/variants/m5stack_unit_c6l/dualboot_c6l_16MB.csv b/variants/m5stack_unit_c6l/dualboot_c6l_16MB.csv
+new file mode 100644
+index 00000000..4943c5fb
+--- /dev/null
++++ b/variants/m5stack_unit_c6l/dualboot_c6l_16MB.csv
+@@ -0,0 +1,8 @@
++# Name,     Type, SubType, Offset,   Size,     Flags
++nvs,        data, nvs,     0x009000, 0x005000,
++otadata,    data, ota,     0x00E000, 0x002000,
++app0,       app,  ota_0,   0x010000, 0x640000,
++app1,       app,  ota_1,   0x650000, 0x640000,
++spiffs,     data, spiffs,  0xC90000, 0x300000,
++mc_spiffs,  data, spiffs,  0xF90000, 0x060000,
++coredump,   data, coredump,0xFF0000, 0x010000,
+\ No newline at end of file
+diff --git a/variants/m5stack_unit_c6l/platformio.ini b/variants/m5stack_unit_c6l/platformio.ini
+index ea4d852d..76b5ac6b 100644
+--- a/variants/m5stack_unit_c6l/platformio.ini
++++ b/variants/m5stack_unit_c6l/platformio.ini
+@@ -1,10 +1,11 @@
+ [M5Stack_Unit_C6L]
+ extends = esp32c6_base
+ board = esp32-c6-devkitm-1
+-board_build.partitions = min_spiffs.csv ; get around 4mb flash limit
++board_build.partitions = variants/m5stack_unit_c6l/partitions_4mb_256k_spiffs.csv
+ board_build.flash_mode = dio ; board manifest defaults to qio, which causes a boot crash-loop on this module
+ build_flags =
+   ${esp32c6_base.build_flags}
++  -D MESHCORE_M5STACK_UNIT_C6L
+   ${sensor_base.build_flags}
+   -I variants/m5stack_unit_c6l
+   -D P_LORA_TX_LED=15
+@@ -16,8 +17,8 @@ build_flags =
+   -D P_LORA_BUSY=19
+   -D P_LORA_RESET=-1
+   -D PIN_BUZZER=11
+-  -D PIN_BOARD_SDA=16
+-  -D PIN_BOARD_SCL=17
++  -D PIN_BOARD_SDA=10
++  -D PIN_BOARD_SCL=8
+   -D SX126X_RXEN=5
+   -D SX126X_DIO2_AS_RF_SWITCH=true
+   -D SX126X_DIO3_TCXO_VOLTAGE=1.8
+@@ -73,7 +74,10 @@ lib_deps =
+ 
+ [env:M5Stack_Unit_C6L_companion_radio_ble]
+ extends = M5Stack_Unit_C6L
+-build_flags = ${M5Stack_Unit_C6L.build_flags}
++build_flags =
++  ${M5Stack_Unit_C6L.build_flags}
++  -D C6L_OLED_TEST
++  -D P_LORA_TX_NEOPIXEL_LED=2
+   -D MAX_CONTACTS=350
+   -D MAX_GROUP_CHANNELS=40
+   -D BLE_PIN_CODE=123456
+@@ -81,12 +85,45 @@ build_flags = ${M5Stack_Unit_C6L.build_flags}
+   -D OFFLINE_QUEUE_SIZE=256
+ ;  -D MESH_PACKET_LOGGING=1
+ ;  -D MESH_DEBUG=1
++build_unflags =
++  -D P_LORA_TX_LED=15
++build_src_filter = ${M5Stack_Unit_C6L.build_src_filter}
++  +<helpers/esp32/*.cpp>
++  -<helpers/esp32/ESPNOWRadio.cpp>
++  +<../examples/companion_radio/*.cpp>
++  +<helpers/ui/buzzer.cpp>
++  +<../variants/m5stack_unit_c6l/UnitC6LOLEDDisplay.cpp>
++lib_deps =
++  ${M5Stack_Unit_C6L.lib_deps}
++  https://github.com/meshtastic/esp8266-oled-ssd1306/archive/bb93fd40685f22e850330ea162f1dd154a4e0685.zip
++  densaugeo/base64 @ ~1.4.0
++  end2endzone/NonBlockingRTTTL@^1.3.0
++
++[env:M5Stack_Unit_C6L_companion_radio_ble_dualboot]
++extends = M5Stack_Unit_C6L
++board_upload.flash_size = 16MB
++board_build.partitions = variants/m5stack_unit_c6l/dualboot_c6l_16MB.csv
++build_flags =
++  ${M5Stack_Unit_C6L.build_flags}
++  -D C6L_OLED_TEST
++  -D P_LORA_TX_NEOPIXEL_LED=2
++  -D MAX_CONTACTS=350
++  -D MAX_GROUP_CHANNELS=40
++  -D BLE_PIN_CODE=123456
++  -D BLE_DEBUG_LOGGING=1
++  -D OFFLINE_QUEUE_SIZE=256
++  -D MESHCORE_DUALBOOT=1
++build_unflags =
++  -D P_LORA_TX_LED=15
+ build_src_filter = ${M5Stack_Unit_C6L.build_src_filter}
+   +<helpers/esp32/*.cpp>
+   -<helpers/esp32/ESPNOWRadio.cpp>
+   +<../examples/companion_radio/*.cpp>
++  +<helpers/ui/buzzer.cpp>
++  +<../variants/m5stack_unit_c6l/UnitC6LOLEDDisplay.cpp>
+ lib_deps =
+   ${M5Stack_Unit_C6L.lib_deps}
++  https://github.com/meshtastic/esp8266-oled-ssd1306/archive/bb93fd40685f22e850330ea162f1dd154a4e0685.zip
+   densaugeo/base64 @ ~1.4.0
+   end2endzone/NonBlockingRTTTL@^1.3.0
+ 
+diff --git a/variants/m5stack_unit_c6l/target.h b/variants/m5stack_unit_c6l/target.h
+index 0a959b97..1cc5ca39 100644
+--- a/variants/m5stack_unit_c6l/target.h
++++ b/variants/m5stack_unit_c6l/target.h
+@@ -8,6 +8,10 @@
+ #include <helpers/radiolib/CustomSX1262Wrapper.h>
+ #include <helpers/AutoDiscoverRTCClock.h>
+ #include <helpers/SensorManager.h>
++#if defined(DISPLAY_CLASS) || defined(C6L_OLED_TEST)
++  #include <UnitC6LOLEDDisplay.h>
++  extern UnitC6LOLEDDisplay display;
++#endif
+ 
+ extern UnitC6LBoard board;
+ extern WRAPPER_CLASS radio_driver;
